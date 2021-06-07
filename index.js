@@ -6,6 +6,7 @@ const v8 = require('v8');
 const path = require('path');
 const { fork } = require('child_process');
 const Module = require('module');
+const sourceMap = require('source-map');
 
 v8.setFlagsFromString('--no-lazy');
 
@@ -14,6 +15,7 @@ if (Number.parseInt(process.versions.node.split('.')[0], 10) >= 12) {
 }
 
 const COMPILED_EXTNAME = '.jsc';
+const DUMMYCODE_LENGTH = 4;
 
 /**
  * Generates v8 bytecode buffer.
@@ -141,15 +143,37 @@ const runBytecode = function (bytecodeBuffer) {
     throw new Error(`bytecodeBuffer must be a buffer object.`);
   }
 
-  fixBytecode(bytecodeBuffer);
-
-  let length = readSourceHash(bytecodeBuffer);
+  let minimize = bytecodeBuffer.readUInt8(0);
+  bytecodeBuffer = bytecodeBuffer.slice(1);
 
   let dummyCode = "";
 
-  if (length > 1) {
-    dummyCode = '"' + "\u200b".repeat(length - 2) + '"'; // "\u200b" Zero width space
+  if (minimize) {
+    let length = readSourceHash(bytecodeBuffer);
+    if (length > 1) {
+      dummyCode = '"' + "\u200b".repeat(length - 2) + '"'; // "\u200b" Zero width space
+    }
+  } else {
+    let dummyCodelength = bytecodeBuffer.slice(0, DUMMYCODE_LENGTH).reduce((sum, number, power) => sum += number * Math.pow(255, power), 0);
+    dummyCode = '"';
+    let dummyStr = bytecodeBuffer.slice(DUMMYCODE_LENGTH, DUMMYCODE_LENGTH + dummyCodelength);
+    let totalLength = 0;
+    for (let i = 0; i < dummyStr.length; i++) {
+      let length = dummyStr.readUInt8(i);
+      totalLength += length;
+      if (i == dummyStr.length - 1) {
+        dummyCode += "\u200b".repeat(totalLength - 2) + '"';
+        break;
+      }
+      if(length != 255) {
+        dummyCode += "\u200b".repeat(totalLength) + "\u000a";
+        totalLength = 0;
+      } 
+    }
+    bytecodeBuffer = bytecodeBuffer.slice(DUMMYCODE_LENGTH + dummyCodelength);
   }
+
+  fixBytecode(bytecodeBuffer);
 
   let script = new vm.Script(dummyCode, {
     cachedData: bytecodeBuffer
@@ -203,11 +227,23 @@ const compileFile = async function (args, output) {
   }
 
   let javascriptCode = fs.readFileSync(filename, 'utf-8');
-
   let code;
+
+  // Determine if the code is compressed into a single line
+  let codeFragments = javascriptCode.split('\n');
+  let minimize = ( codeFragments.length == 1 || (codeFragments.length > 1 && codeFragments.slice(1).every(i => i.startsWith('//'))) )
+    ? true : false;
 
   if (compileAsModule) {
     code = Module.wrap(javascriptCode.replace(/^#!.*/, ''));
+
+    // Rebuild sourcemap to locate error correctly
+    let mapFilename = filename + '.map';
+    if (compileAsModule && fs.existsSync(mapFilename)) {
+      const offset = '(function (exports, require, module, __filename, __dirname) { ';
+      await rebuildSourmap(mapFilename, offset.length);
+      console.log("Rebuild sourcemap!")
+    }
   } else {
     code = javascriptCode.replace(/^#!.*/, '');
   }
@@ -220,7 +256,23 @@ const compileFile = async function (args, output) {
     bytecodeBuffer = compileCode(code);
   }
 
-  fs.writeFileSync(compiledFilename, bytecodeBuffer);
+  if (minimize) {
+    fs.writeFileSync(compiledFilename, Buffer.from([1]));
+  } else{
+    // if code isn't compressed into a single line, generate dummyCode contained line break
+    fs.writeFileSync(compiledFilename, Buffer.from([0]));
+    let dummyCode = await generateDummyCode(code);
+    let length = dummyCode.length;
+    let lengthArr = new Array(DUMMYCODE_LENGTH);
+    for (let i = lengthArr.length - 1; i > 0; i--) {
+      lengthArr[i] = Math.floor(length / Math.pow(255, i));
+      length -= lengthArr[i] * Math.pow(255, i);
+    }
+    lengthArr[0] = length;
+    fs.appendFileSync(compiledFilename, Buffer.from(lengthArr));
+    fs.appendFileSync(compiledFilename, Buffer.from(dummyCode));
+  }
+  fs.appendFileSync(compiledFilename, bytecodeBuffer);
 
   if (createLoader) {
     addLoaderFile(compiledFilename, loaderFilename)
@@ -229,6 +281,20 @@ const compileFile = async function (args, output) {
   return compiledFilename;
 };
 
+
+const generateDummyCode = async function (code) {
+  const arr = code.split('\n');
+  const lengthArr = [];
+  for (let i = 0; i < arr.length; i++) {
+    let length = arr[i].length;
+    while(length >= 255) {
+      lengthArr.push(255);
+      length -= 255;
+    }
+    lengthArr.push(length);
+  }
+  return Buffer.from(lengthArr);
+}
 
 
 /**
@@ -251,15 +317,38 @@ Module._extensions[COMPILED_EXTNAME] = function (fileModule, filename) {
 
   let bytecodeBuffer = fs.readFileSync(filename);
 
-  fixBytecode(bytecodeBuffer);
-
-  let length = readSourceHash(bytecodeBuffer);
+  let minimize = bytecodeBuffer.readUInt8(0);
+  bytecodeBuffer = bytecodeBuffer.slice(1);
 
   let dummyCode = "";
 
-  if (length > 1) {
-    dummyCode = '"' + "\u200b".repeat(length - 2) + '"'; // "\u200b" Zero width space
+  if (minimize) {
+    let length = readSourceHash(bytecodeBuffer);
+    if (length > 1) {
+      dummyCode = '"' + "\u200b".repeat(length - 2) + '"'; // "\u200b" Zero width space
+    }
+  } else {
+    let dummyCodelength = bytecodeBuffer.slice(0, DUMMYCODE_LENGTH).reduce((sum, number, power) => sum += number * Math.pow(255, power), 0);
+    dummyCode = '"';
+    let dummyStr = bytecodeBuffer.slice(DUMMYCODE_LENGTH, DUMMYCODE_LENGTH + dummyCodelength);
+    let totalLength = 0;
+    for (let i = 0; i < dummyStr.length; i++) {
+      let length = dummyStr.readUInt8(i);
+      totalLength += length;
+      if (i == dummyStr.length - 1) {
+        dummyCode += "\u200b".repeat(totalLength - 2) + '"';
+        break;
+      }
+      if(length != 255) {
+        dummyCode += "\u200b".repeat(totalLength) + "\u000a";
+        totalLength = 0;
+      } 
+    }
+    console.log(dummyCode)
+    bytecodeBuffer = bytecodeBuffer.slice(DUMMYCODE_LENGTH + dummyCodelength);
   }
+
+  fixBytecode(bytecodeBuffer);
 
   let script = new vm.Script(dummyCode, {
     filename: filename,
@@ -326,6 +415,35 @@ function loaderCode(targetPath) {
     require('${targetPath}');
   `;
 }
+
+async function rebuildSourmap (filePath, offset) {
+  let incomingSourceMap = fs.readFileSync(filePath, 'utf-8');
+  incomingSourceMap = JSON.parse(incomingSourceMap);
+  var consumer = await new sourceMap.SourceMapConsumer(incomingSourceMap);
+  var generator = await new sourceMap.SourceMapGenerator({
+      file: incomingSourceMap.file,
+      sourceRoot: incomingSourceMap.sourceRoot
+  });
+  consumer.eachMapping(function (m) {
+    if (typeof m.originalLine === 'number' && 0 < m.originalLine &&
+        typeof m.originalColumn === 'number' && 0 <= m.originalColumn &&
+        m.source) {
+        generator.addMapping({
+            source: m.source,
+            name: m.name,
+            original: { line: m.originalLine, column: m.originalColumn },
+            generated: { line: m.generatedLine, column: m.generatedColumn + offset}
+        });
+    }
+  });
+  var outgoingSourceMap = JSON.parse(generator.toString());
+  if (typeof incomingSourceMap.sourcesContent !== 'undefined') {
+      outgoingSourceMap.sourcesContent = incomingSourceMap.sourcesContent;
+  }
+  outgoingSourceMap = JSON.stringify(outgoingSourceMap)
+  fs.writeFileSync(filePath, outgoingSourceMap);
+  return;
+};
 
 global.bytenode = {
   compileCode, compileFile, compileElectronCode,
