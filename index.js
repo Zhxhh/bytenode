@@ -143,35 +143,24 @@ const runBytecode = function (bytecodeBuffer) {
     throw new Error(`bytecodeBuffer must be a buffer object.`);
   }
 
-  let minimize = bytecodeBuffer.readUInt8(0);
-  bytecodeBuffer = bytecodeBuffer.slice(1);
+  let dummyCode = '"';
 
-  let dummyCode = "";
-
-  if (minimize) {
-    let length = readSourceHash(bytecodeBuffer);
-    if (length > 1) {
-      dummyCode = '"' + "\u200b".repeat(length - 2) + '"'; // "\u200b" Zero width space
+  let dummyCodelength = bytecodeBuffer.slice(0, DUMMYCODE_LENGTH).reduce((sum, number, power) => sum += number * Math.pow(255, power), 0);
+  let dummyStr = bytecodeBuffer.slice(DUMMYCODE_LENGTH, DUMMYCODE_LENGTH + dummyCodelength);
+  let totalLength = 0;
+  for (let i = 0; i < dummyStr.length; i++) {
+    let length = dummyStr.readUInt8(i);
+    totalLength += length;
+    if (i == dummyStr.length - 1) {
+      dummyCode += "\u200b".repeat(totalLength - 2) + '"';
+      break;
     }
-  } else {
-    let dummyCodelength = bytecodeBuffer.slice(0, DUMMYCODE_LENGTH).reduce((sum, number, power) => sum += number * Math.pow(255, power), 0);
-    dummyCode = '"';
-    let dummyStr = bytecodeBuffer.slice(DUMMYCODE_LENGTH, DUMMYCODE_LENGTH + dummyCodelength);
-    let totalLength = 0;
-    for (let i = 0; i < dummyStr.length; i++) {
-      let length = dummyStr.readUInt8(i);
-      totalLength += length;
-      if (i == dummyStr.length - 1) {
-        dummyCode += "\u200b".repeat(totalLength - 2) + '"';
-        break;
-      }
-      if(length != 255) {
-        dummyCode += "\u200b".repeat(totalLength) + "\u000a";
-        totalLength = 0;
-      } 
-    }
-    bytecodeBuffer = bytecodeBuffer.slice(DUMMYCODE_LENGTH + dummyCodelength);
+    if(length != 255) {
+      dummyCode += "\u200b".repeat(totalLength) + "\u000a";
+      totalLength = 0;
+    } 
   }
+  bytecodeBuffer = bytecodeBuffer.slice(DUMMYCODE_LENGTH + dummyCodelength);
 
   fixBytecode(bytecodeBuffer);
 
@@ -251,17 +240,17 @@ const compileFile = async function (args, output) {
     bytecodeBuffer = compileCode(code);
   }
 
-    // if code isn't compressed into a single line, generate dummyCode contained line break
-    let dummyCode = await generateDummyCode(code);
-    let length = dummyCode.length;
-    let lengthArr = new Array(DUMMYCODE_LENGTH);
-    for (let i = lengthArr.length - 1; i > 0; i--) {
-      lengthArr[i] = Math.floor(length / Math.pow(255, i));
-      length -= lengthArr[i] * Math.pow(255, i);
-    }
-    lengthArr[0] = length;
-    fs.writeFileSync(compiledFilename, Buffer.from(lengthArr));
-    fs.appendFileSync(compiledFilename, Buffer.from(dummyCode));
+  // generate dummyCode contained line break
+  let dummyCode = await generateDummyCode(code);
+  let length = dummyCode.length;
+  let lengthArr = new Array(DUMMYCODE_LENGTH);
+  for (let i = lengthArr.length - 1; i > 0; i--) {
+    lengthArr[i] = Math.floor(length / Math.pow(255, i));
+    length -= lengthArr[i] * Math.pow(255, i);
+  }
+  lengthArr[0] = length;
+  fs.writeFileSync(compiledFilename, Buffer.from(lengthArr));
+  fs.appendFileSync(compiledFilename, Buffer.from(dummyCode));
   fs.appendFileSync(compiledFilename, bytecodeBuffer);
 
   if (createLoader) {
